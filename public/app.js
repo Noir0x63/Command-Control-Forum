@@ -267,21 +267,11 @@ class ApiService {
     return this.#fetchJSON(`${API_BASE}/auth/captcha`);
   }
 
-  register(codename, password, publicKeySPKI, encryptedPrivateKey, email, captchaInput, captchaToken, powChallenge, powSalt) {
+  register(registrationBody) {
     return this.#fetchJSON(`${API_BASE}/auth/register`, {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
-      body:    JSON.stringify({ 
-        codename, 
-        password, 
-        publicKeySPKI, 
-        encryptedPrivateKey, 
-        email, 
-        captchaInput, 
-        captchaToken, 
-        powChallenge, 
-        powSalt 
-      }),
+      body:    JSON.stringify(registrationBody),
     });
   }
 
@@ -534,7 +524,7 @@ class AppState {
     this.notify();
   }
 
-  async register(codename, passphrase, email, captchaInput, captchaToken, powChallenge, powSalt) {
+  async register(codename, passphrase, captchaInput, captchaToken, powChallenge, powSalt, registerBody, hpToken, captchaIssuedAt) {
     if (codename.length < 3) throw new Error('Codename too short.');
 
     const keyPair   = await CryptoEngine.generateKeyPair();
@@ -542,7 +532,19 @@ class AppState {
     const { authKey, aesKey } = await CryptoEngine.deriveKeys(passphrase, codename);
     const encPriv   = await CryptoEngine.encryptPrivateKey(keyPair.privateKey, aesKey);
 
-    await this.api.register(codename, authKey, pubSPKI, encPriv, email, captchaInput, captchaToken, powChallenge, powSalt);
+    await this.api.register({
+      codename,
+      password: authKey,
+      publicKeySPKI: pubSPKI,
+      encryptedPrivateKey: encPriv,
+      captchaInput,
+      captchaToken,
+      powChallenge,
+      powSalt,
+      hpToken,
+      captchaIssuedAt,
+      ...registerBody,
+    });
     await this.login(codename, passphrase);
   }
 
@@ -837,12 +839,15 @@ class UIController {
     this.captchaInput     = document.getElementById('captcha-input');
     this.btnRefreshCaptcha = document.getElementById('btn-refresh-captcha');
     this.powStatus        = document.getElementById('pow-status');
-    this.authEmailField   = document.getElementById('agent-email');
+    this.honeypotContainer = document.getElementById('honeypot-container');
     
     this.captchaToken     = null;
     this.powChallenge     = null;
     this.powDifficulty    = 4;
     this.powSolvedSalt    = null;
+    this.hpToken          = null;
+    this.captchaIssuedAt  = null;
+    this.honeypotFieldNames = [];
 
     this.profCodename = document.getElementById('prof-codename');
     this.profRole     = document.getElementById('prof-role');
@@ -989,12 +994,25 @@ class UIController {
 
       try {
         if (mode === 'register') {
-          const emailVal = this.authEmailField.value;
           const captchaVal = this.captchaInput.value.trim();
           if (!this.powSolvedSalt) {
             throw new Error('Proof of Work challenge not solved yet.');
           }
-          await this.state.register(alias, secret, emailVal, captchaVal, this.captchaToken, this.powChallenge, this.powSolvedSalt);
+
+          // C2-004: Build dynamic honeypot field values for submission.
+          // All honeypot fields SHOULD be empty (human won't see them).
+          // We send them as empty strings so the server can verify they're unfilled.
+          const honeypotValues = {};
+          for (const name of this.honeypotFieldNames) {
+            const el = document.querySelector(`[name="${name}"]`);
+            honeypotValues[name] = el ? el.value : '';
+          }
+
+          await this.state.register(
+            alias, secret,
+            captchaVal, this.captchaToken, this.powChallenge, this.powSolvedSalt,
+            honeypotValues, this.hpToken, this.captchaIssuedAt
+          );
         } else {
           await this.state.login(alias, secret);
         }
@@ -1087,6 +1105,11 @@ class UIController {
       this.captchaToken = res.captchaToken;
       this.powChallenge = res.powChallenge;
       this.powDifficulty = res.powDifficulty;
+      this.hpToken = res.hpToken;
+      this.captchaIssuedAt = res.captchaIssuedAt;
+      
+      // C2-004: Dynamically render honeypot fields
+      this.#renderHoneypotFields(res.honeypotFields || []);
       
       this.captchaImg.src = `data:image/svg+xml;base64,${res.captchaSvg}`;
       await this.#solvePoW(res.powChallenge, res.powDifficulty);
@@ -1094,6 +1117,57 @@ class UIController {
       console.error('[C2 Captcha Engine] Fetch error:', err);
       this.powStatus.textContent = 'PoW State: Error';
       this.powStatus.style.color = '#ef4444';
+    }
+  }
+
+  #renderHoneypotFields(fields) {
+    if (!this.honeypotContainer) return;
+    this.honeypotContainer.innerHTML = '';
+    this.honeypotFieldNames = [];
+
+    const techniqueStyles = [
+      // Technique 0: Positioned off-screen (screen readers may still find)
+      'position:absolute;left:-9999px;top:-9999px;width:1px;height:1px;overflow:hidden;opacity:0;pointer-events:none;',
+      // Technique 1: Zero opacity, still in layout flow (bots parsing layout may miss)
+      'opacity:0;height:0;overflow:hidden;padding:0;margin:0;border:none;',
+      // Technique 2: type="hidden" wrapped in visibly hidden container
+      '',
+    ];
+
+    for (const field of fields) {
+      const style = techniqueStyles[field.technique] || techniqueStyles[0];
+      const wrapper = document.createElement('div');
+      wrapper.setAttribute('style', style);
+      wrapper.setAttribute('aria-hidden', 'true');
+
+      if (field.technique === 2) {
+        const input = document.createElement('input');
+        input.type = 'hidden';
+        input.name = field.name;
+        input.setAttribute('autocomplete', 'off');
+        input.setAttribute('tabindex', '-1');
+        input.value = '';
+        wrapper.appendChild(input);
+      } else {
+        const label = document.createElement('label');
+        label.textContent = field.label;
+        label.setAttribute('style', 'font-size:9px;color:#333;margin-bottom:2px;display:none;');
+        label.htmlFor = `hp-${field.name}`;
+
+        const input = document.createElement('input');
+        input.type = 'text';
+        input.name = field.name;
+        input.id = `hp-${field.name}`;
+        input.setAttribute('autocomplete', 'off');
+        input.setAttribute('tabindex', '-1');
+        input.setAttribute('style', 'background:#000;color:#333;border:1px solid #111;font-size:8px;padding:2px;width:100%;');
+
+        wrapper.appendChild(label);
+        wrapper.appendChild(input);
+      }
+
+      this.honeypotContainer.appendChild(wrapper);
+      this.honeypotFieldNames.push(field.name);
     }
   }
 
@@ -1110,6 +1184,11 @@ class UIController {
       this.#loadCaptchaChallenge();
     } else {
       this.captchaContainer.classList.add('hide');
+      // C2-004: Destroy honeypot fields when not in register mode
+      if (this.honeypotContainer) this.honeypotContainer.innerHTML = '';
+      this.honeypotFieldNames = [];
+      this.hpToken = null;
+      this.captchaIssuedAt = null;
     }
   }
 

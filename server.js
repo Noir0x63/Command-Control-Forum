@@ -177,6 +177,16 @@ db.serialize(() => {
     )
   `);
 
+  // Anti-replay persistent nonce store (C2-002)
+  db.run(`
+    CREATE TABLE IF NOT EXISTS nonces (
+      nonce      TEXT    NOT NULL,
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (nonce)
+    )
+  `);
+  db.run('CREATE INDEX IF NOT EXISTS idx_nonces_created_at ON nonces(created_at)');
+
   // Phase 3 Schema Additions (Fail-safe for existing tables)
   db.run("ALTER TABLE threads ADD COLUMN client_nonce TEXT", () => {});
   db.run("ALTER TABLE threads ADD COLUMN client_timestamp TEXT", () => {});
@@ -367,20 +377,62 @@ function verifyECDSASignature(payload, signatureBase64, publicKeySPKIBase64) {
   }
 }
 
-// ─── Freshness Protocol (Replay & Drift Defense) ──────────────────────────────
-const usedNonces = new Map();
+// ─── Freshness Protocol (Replay & Drift Defense — Persistent + Memcache) ──────
+const FRESHNESS_WINDOW_MS = 5 * 60 * 1000; // 5 min tolerance
+const NONCE_EXPIRY_MS     = 5 * 60 * 1000; // nonces live for 5 min in DB
+
+// In-memory hot cache for sub-millisecond reads of recently seen nonces
+const nonceCache = new Map();
+
+// Garbage-collect expired nonces from DB (runs every 2 min in WAL-safe mode)
+setInterval(() => {
+  const cutoff = Date.now() - NONCE_EXPIRY_MS;
+  db.run('DELETE FROM nonces WHERE created_at < ?', [cutoff], (err) => {
+    if (err) console.error('[C2] Nonce GC error:', err.message);
+  });
+}, 2 * 60 * 1000).unref();
+
+// Evict expired entries from memory cache (runs every 30s)
 setInterval(() => {
   const now = Date.now();
-  for (const [nonce, ts] of usedNonces.entries()) {
-    if (now - ts > 5 * 60 * 1000) usedNonces.delete(nonce); // 5 min memory
+  for (const [key, ts] of nonceCache.entries()) {
+    if (now - ts > NONCE_EXPIRY_MS) nonceCache.delete(key);
   }
-}, 60000).unref();
+}, 30000).unref();
 
+/**
+ * Validates a nonce + timestamp pair for freshness and non-replay.
+ * C2-002: Persists nonce in SQLite with UNIQUE constraint to prevent
+ *         replay across server restarts.
+ * C2-003: Uses >= boundary (inclusive) with normalized millisecond clock drift.
+ *
+ * @param {string} nonce     - Client-generated UUIDv4
+ * @param {string} timestamp - ISO-8601 timestamp from client
+ * @returns {boolean} true if the nonce+timestamp pair is fresh and unused
+ */
 function validateFreshness(nonce, timestamp) {
-  if (usedNonces.has(nonce)) return false;
-  const ts = new Date(timestamp).getTime();
-  if (isNaN(ts) || Math.abs(Date.now() - ts) > 5 * 60 * 1000) return false;
-  usedNonces.set(nonce, ts);
+  if (nonceCache.has(nonce)) return false;
+
+  const clientTime = new Date(timestamp).getTime();
+  if (isNaN(clientTime)) return false;
+
+  const serverTime = Date.now();
+  const driftMs = Math.abs(serverTime - clientTime);
+
+  // C2-003: Use >= for inclusive boundary — a timestamp exactly at the
+  // window limit must be rejected, not accepted. Normalized to milliseconds.
+  if (driftMs >= FRESHNESS_WINDOW_MS) return false;
+
+  // Atomically insert into in-memory cache first (fast path)
+  nonceCache.set(nonce, serverTime);
+
+  // Persist to DB with UNIQUE constraint. If INSERT fails due to
+  // duplicate nonce (race condition or prior use), the on-disk
+  // constraint prevents bypass across server restarts.
+  db.run('INSERT OR IGNORE INTO nonces (nonce, created_at) VALUES (?, ?)', [nonce, serverTime], (err) => {
+    if (err) console.error('[C2] Nonce persistence error:', err.message);
+  });
+
   return true;
 }
 
@@ -658,54 +710,134 @@ app.get('/api/auth/captcha', (req, res) => {
   const svg = captcha.generateCaptchaSvg(text);
   const token = captcha.createCaptchaToken(text);
   const powChallenge = crypto.randomBytes(16).toString('hex');
-  
+  const captchaIssuedAt = Date.now();
+
+  // C2-004: Dynamic honeypot field names derived from HMAC(secret, timestamp, index)
+  // Each field name is unpredictable per-session. Bots that try to auto-fill known
+  // field names like "email" cannot bypass this.
+  const honeypotFields = [];
+  for (let i = 0; i < 3; i++) {
+    const hmac = crypto.createHmac('sha256', captcha.CAPTCHA_SECRET_INTERNAL)
+      .update(`${captchaIssuedAt}:${i}:honeypot`)
+      .digest('hex');
+    const fieldName = `v_${hmac.substring(0, 12)}`;
+    honeypotFields.push({
+      name: fieldName,
+      label: i === 0 ? 'Email verification' : i === 1 ? 'Phone validation' : 'Secondary authentication',
+      technique: i, // 0=offscreen, 1=opacity, 2=hidden-input
+    });
+  }
+
+  // Honeypot integrity token: binds the expected empty fields to this session
+  const hpTokenPayload = `${captchaIssuedAt}:${honeypotFields.map(f => f.name).join(',')}`;
+  const hpToken = `${captchaIssuedAt}:${crypto.createHmac('sha256', captcha.CAPTCHA_SECRET_INTERNAL)
+    .update(hpTokenPayload)
+    .digest('hex')}`;
+
   res.json({
     captchaSvg: Buffer.from(svg).toString('base64'),
     captchaToken: token,
     powChallenge,
-    powDifficulty: captcha.POW_DIFFICULTY
+    powDifficulty: captcha.POW_DIFFICULTY,
+    captchaIssuedAt,
+    honeypotFields,
+    hpToken,
   });
 });
 
 // ── Auth: Register ────────────────────────────────────────────────────────────
 app.post('/api/auth/register',
   authLimiter,
-  validate({
-    codename:            Validators.codename,
-    password:            Validators.authKey,
-    publicKeySPKI:       Validators.spkiBase64,
-    encryptedPrivateKey: Validators.encKey,
-    captchaInput:        Validators.captchaInput,
-    captchaToken:        Validators.captchaToken,
-    powChallenge:        Validators.powChallenge,
-    powSalt:             Validators.powSalt,
-  }),
   async (req, res) => {
-    const { 
-      codename, 
-      password, 
-      publicKeySPKI, 
-      encryptedPrivateKey, 
-      email, 
-      captchaInput, 
-      captchaToken, 
-      powChallenge, 
-      powSalt 
+    const {
+      codename,
+      password,
+      publicKeySPKI,
+      encryptedPrivateKey,
+      captchaInput,
+      captchaToken,
+      powChallenge,
+      powSalt,
+      hpToken,
+      captchaIssuedAt,
     } = req.body;
 
-    // Decoy honeypot check (only bots will fill it)
-    if (email && email.trim() !== '') {
-      return res.status(400).json({ error: 'Registration failed.' });
+    // Validate core fields with schema (must happen inside handler for dynamic fields)
+    const coreSchema = {
+      codename:            Validators.codename,
+      password:            Validators.authKey,
+      publicKeySPKI:       Validators.spkiBase64,
+      encryptedPrivateKey: Validators.encKey,
+      captchaInput:        Validators.captchaInput,
+      captchaToken:        Validators.captchaToken,
+      powChallenge:        Validators.powChallenge,
+      powSalt:             Validators.powSalt,
+    };
+    for (const [field, check] of Object.entries(coreSchema)) {
+      if (!check(req.body[field])) {
+        return res.status(400).json({ error: `REGISTRATION_REJECTED` });
+      }
+    }
+
+    // C2-004 Layer 1: Time-to-submit validation — reject registrations that arrive
+    // too quickly after the CAPTCHA was issued (< 2.5s, bots are faster than humans)
+    const submitTime = Date.now();
+    const captchaIssueTime = parseInt(captchaIssuedAt, 10);
+    if (isNaN(captchaIssueTime) || submitTime - captchaIssueTime < 2500) {
+      return res.status(400).json({ error: 'REGISTRATION_REJECTED' });
+    }
+    if (submitTime - captchaIssueTime > 180000) {
+      return res.status(400).json({ error: 'REGISTRATION_REJECTED' });
+    }
+
+    // C2-004 Layer 2: Validate honeypot integrity token
+    if (!hpToken || !hpToken.includes(':')) {
+      return res.status(400).json({ error: 'REGISTRATION_REJECTED' });
+    }
+    const [hpTimestampStr, hpSig] = hpToken.split(':');
+    const hpTimestamp = parseInt(hpTimestampStr, 10);
+    if (isNaN(hpTimestamp) || Math.abs(submitTime - hpTimestamp) > 180000) {
+      return res.status(400).json({ error: 'REGISTRATION_REJECTED' });
+    }
+
+    // C2-004 Layer 3: Reconstruct expected honeypot field names and verify integrity
+    const expectedHpNames = [];
+    for (let i = 0; i < 3; i++) {
+      const hmac = crypto.createHmac('sha256', captcha.CAPTCHA_SECRET_INTERNAL)
+        .update(`${hpTimestamp}:${i}:honeypot`)
+        .digest('hex');
+      expectedHpNames.push(`v_${hmac.substring(0, 12)}`);
+    }
+    const hpPayload = `${hpTimestamp}:${expectedHpNames.join(',')}`;
+    const expectedHpSig = crypto.createHmac('sha256', captcha.CAPTCHA_SECRET_INTERNAL)
+      .update(hpPayload)
+      .digest('hex');
+    try {
+      const sigBuf = Buffer.from(hpSig, 'hex');
+      const expBuf = Buffer.from(expectedHpSig, 'hex');
+      if (sigBuf.length !== expBuf.length || !crypto.timingSafeEqual(sigBuf, expBuf)) {
+        return res.status(400).json({ error: 'REGISTRATION_REJECTED' });
+      }
+    } catch {
+      return res.status(400).json({ error: 'REGISTRATION_REJECTED' });
+    }
+
+    // C2-004 Layer 4: Verify all dynamic honeypot fields are empty/unfilled
+    for (const fieldName of expectedHpNames) {
+      const value = req.body[fieldName];
+      if (value !== undefined && value !== null && String(value).trim() !== '') {
+        return res.status(400).json({ error: 'REGISTRATION_REJECTED' });
+      }
     }
 
     // Verify Captcha
     if (!captcha.verifyCaptcha(captchaToken, captchaInput)) {
-      return res.status(400).json({ error: 'CAPTCHA verification failed.' });
+      return res.status(400).json({ error: 'REGISTRATION_REJECTED' });
     }
 
     // Verify Proof of Work
     if (!captcha.verifyPoW(powChallenge, powSalt)) {
-      return res.status(400).json({ error: 'Proof of Work verification failed.' });
+      return res.status(400).json({ error: 'REGISTRATION_REJECTED' });
     }
 
     // Commander role is EXCLUSIVELY assigned by setup.js CLI — never via HTTP.

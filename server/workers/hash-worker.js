@@ -35,10 +35,13 @@ parentPort.on('message', async (msg) => {
       const params = version === 'v2' ? SCRYPT_PARAMS : { N: 16384, r: 8, p: 1 };
       crypto.scrypt(password, salt, SCRYPT_KEY_LEN, params, (err, dk) => {
         if (err) return parentPort.postMessage({ id, error: err.message });
-        const buf1 = Buffer.from(key, 'hex');
-        const buf2 = dk;
-        if (buf1.length !== buf2.length) return parentPort.postMessage({ id, result: false });
-        parentPort.postMessage({ id, result: crypto.timingSafeEqual(buf1, buf2) });
+        const storedBuf = Buffer.from(key, 'hex');
+        const derivedBuf = dk;
+        // Constant-time comparison even when lengths differ:
+        // compute hash of both buffers first to avoid leaking length information
+        const storedHash  = crypto.createHash('sha256').update(storedBuf).digest();
+        const derivedHash = crypto.createHash('sha256').update(derivedBuf).digest();
+        parentPort.postMessage({ id, result: crypto.timingSafeEqual(storedHash, derivedHash) });
       });
     }
   } catch (err) {
