@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Command &amp; Control</title>
+  <!--
+    Google Fonts removed: external font CDNs violate CSP fontSrc: ["'self'"].
+    JetBrains Mono is loaded directly from index.css via @font-face (self-hosted subset)
+    or falls back to system monospace.
+  -->
+  <link rel="stylesheet" href="index.css">
+  <!-- KaTeX Math Styling -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
+  
+  <!-- Markdown & HTML Sanitizer libraries -->
+  <script src="https://cdn.jsdelivr.net/npm/marked@12.0.1/marked.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.9/dist/purify.min.js"></script>
+  
+  <!-- Highlight.js for Code Syntax Highlighting -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/github-dark.min.css">
+  <script src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+  
+  <!-- KaTeX Mathematical Notation Renderer -->
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/contrib/auto-render.min.js"></script>
+  <!-- Socket.io Real-Time Client -->
+  <script src="https://cdn.jsdelivr.net/npm/socket.io-client@4.7.4/dist/socket.io.min.js"></script>
+</head>
+<body class="theme-noir">
+
+  <!-- Main Centered App Container -->
+  <div id="app" class="c2-container">
+    
+    <!-- Centered Header Navigation -->
+    <header class="c2-header">
+      <div class="header-brand" style="display:flex;gap:12px;align-items:center;">
+        <span class="brand-text">&gt; Command & Control</span>
+        <span id="keystore-status" class="integrity-badge compromised" style="font-size: 8px; padding: 2px 5px; height: fit-content; line-height: 1;">KEY: LOCKED</span>
+      </div>
+      <nav class="header-nav">
+        <button id="nav-btn-feed" class="c2-btn active">◇ threads</button>
+        <button id="nav-btn-profile" class="c2-btn hide">◇ profile</button>
+        <button id="btn-login" class="c2-btn">◇ login</button>
+      </nav>
+    </header>
+
+    <!-- Main Content Frame (Centered Card) -->
+    <div class="c2-workspace">
+      
+      <!-- Feed view -->
+      <section id="feed-view" class="content-section active">
+        <div class="feed-layout">
+          <!-- Sidebar Channels Navigation -->
+          <aside class="c2-sidebar">
+            <div class="sidebar-title"># CATEGORIES</div>
+            <nav class="sidebar-nav">
+              <button class="sidebar-item active" data-category="all">◇ all</button>
+              <button class="sidebar-item" data-category="announcements"># announcements</button>
+              <button class="sidebar-item" data-category="applied-crypto"># applied_crypto</button>
+              <button class="sidebar-item" data-category="low-level"># low_level_dev</button>
+              <button class="sidebar-item" data-category="web-security"># web_security</button>
+              <button class="sidebar-item" data-category="reverse-eng"># reverse_engineering</button>
+              <button class="sidebar-item" data-category="secure-coding"># secure_coding</button>
+              <button class="sidebar-item" data-category="pentesting"># pentesting</button>
+              <button class="sidebar-item" data-category="red-team"># red_team</button>
+              <button class="sidebar-item" data-category="blue-team"># blue_team</button>
+              <button class="sidebar-item" data-category="malware"># malware_analysis</button>
+            </nav>
+            <div class="sidebar-title" style="margin-top:20px; border-top:1px solid #111; padding-top:15px;"># ACTIVE_USERS</div>
+            <div id="active-nodes-list" style="display:flex; flex-direction:column; gap:8px; margin-top:10px;">
+              <!-- Populated dynamically -->
+            </div>
+          </aside>
+
+          <!-- Main Feed Column -->
+          <div class="feed-main">
+            <div class="content-header">
+              <div class="search-sort-container" style="display:flex;gap:10px;align-items:center;">
+                <input type="text" id="search-box" class="c2-form" placeholder="Search..." style="width:160px;margin-bottom:0;padding:6px 10px;background:#000;color:#00ff66;border:1px solid #111;">
+                <select id="sort-select" style="padding:6px;background:#000;color:#00ff66;border:1px solid #111;font-size:11px;font-family:inherit;">
+                  <option value="recent">sort: recent</option>
+                  <option value="score">sort: score</option>
+                  <option value="replies">sort: replies</option>
+                </select>
+              </div>
+              <button id="btn-new-thread" class="c2-btn" disabled>+ CREATE_THREAD</button>
+            </div>
+        
+        <div class="thread-feed" id="thread-feed">
+          <!-- Threads populated dynamically -->
+        </div>
+      </div> <!-- Close feed-main -->
+    </div> <!-- Close feed-layout -->
+  </section>
+
+      <!-- Thread Detail view -->
+      <section id="thread-view" class="content-section">
+        <div class="content-header">
+          <button id="btn-back-feed" class="c2-btn">&lt; back</button>
+          <span class="thread-id-tag" id="detail-thread-id">ID: 0x0000</span>
+        </div>
+        
+        <div class="thread-detail-container">
+          <div id="thread-detail-op">
+            <!-- OP Thread post loaded dynamically -->
+          </div>
+          
+          <div class="comments-section">
+            <div class="section-title">REPLIES</div>
+            <div id="comments-list" class="comments-list">
+              <!-- Comments loaded dynamically -->
+            </div>
+            
+            <!-- Reply input -->
+            <div class="reply-form-container" id="reply-form-container">
+              <p class="restricted-info" id="reply-restricted-info">Access denied. Please login to reply.</p>
+              <form id="reply-form" class="c2-form hide">
+                <div class="form-group">
+                  <textarea id="reply-content" placeholder="Write a reply..." rows="4" required></textarea>
+                </div>
+                <div class="form-actions">
+                  <button type="submit" class="c2-btn">Reply</button>
+                </div>
+              </form>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- Create Thread view -->
+      <section id="create-view" class="content-section">
+        <div class="content-header">
+          <button id="btn-cancel-create" class="c2-btn">&lt; cancel</button>
+          <span class="view-title">Create new thread</span>
+        </div>
+        
+        <form id="create-thread-form" class="c2-form">
+          <div class="form-group">
+            <label for="thread-title">Title</label>
+            <input type="text" id="thread-title" placeholder="Title..." required>
+          </div>
+          <div class="form-group">
+            <label for="thread-category">Category</label>
+            <select id="thread-category" required>
+              <option value="announcements">#announcements</option>
+              <option value="applied-crypto">#applied_crypto</option>
+              <option value="low-level">#low_level_dev</option>
+              <option value="web-security">#web_security</option>
+              <option value="reverse-eng">#reverse_engineering</option>
+              <option value="secure-coding">#secure_coding</option>
+              <option value="pentesting">#pentesting</option>
+              <option value="red-team">#red_team</option>
+              <option value="blue-team">#blue_team</option>
+              <option value="malware">#malware_analysis</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label for="thread-content">Content</label>
+            <textarea id="thread-content" placeholder="Thread content... (Signed automatically with your key)" rows="10" required></textarea>
+          </div>
+          <div class="form-actions">
+            <button type="submit" class="c2-btn">Create thread</button>
+          </div>
+        </form>
+      </section>
+
+      <!-- Profile / Customization View -->
+      <section id="profile-view" class="content-section">
+        <div class="content-header">
+          <button id="btn-close-profile" class="c2-btn">&lt; back</button>
+          <span class="view-title">Agent profile</span>
+        </div>
+        <div class="panel-content profile-layout">
+          <div class="profile-grid">
+            <div class="profile-details-card">
+              <div class="section-title">Statistics</div>
+              <div class="stat-row"><strong>Username:</strong> <span id="prof-codename">--</span></div>
+              <div class="stat-row"><strong>Role:</strong> <span id="prof-role">--</span></div>
+              <div class="stat-row"><strong>Joined:</strong> <span id="prof-joined">--</span></div>
+              <div class="stat-row"><strong>Reputation:</strong> <span id="prof-reputation" class="text-accent" style="font-weight:bold;">0</span></div>
+              
+              <form id="profile-settings-form" class="c2-form" style="padding: 15px 0 0 0;">
+                <div class="form-group">
+                  <label for="prof-bio">Bio</label>
+                  <textarea id="prof-bio" placeholder="Write bio..." rows="4"></textarea>
+                </div>
+                <button type="submit" class="c2-btn block-btn" style="margin-top: 10px;">Save changes</button>
+              </form>
+            </div>
+
+            <div class="profile-security-card">
+              <div class="section-title" style="margin-top: 0;">Cryptographic Key</div>
+              <p class="profile-info-text">Your private signing key is stored encrypted on the server (AES-256-GCM). It is decrypted locally in your browser when you login using your password.</p>
+              <div class="form-group" style="margin-top: 15px;">
+                <label>Public Key (PEM)</label>
+                <textarea id="prof-pubkey" readonly rows="7" style="font-size: 9px; background-color: #000000; color: #777777; border-color: #1a1a1a;"></textarea>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>
+
+  <!-- Login Modal / Portal Authenticator -->
+  <div id="login-modal" class="c2-overlay">
+    <div class="terminal-card">
+      <div class="card-header">
+        <span class="card-title" id="auth-modal-title">Login / Register</span>
+        <button id="btn-close-login" class="c2-btn close-btn">[X]</button>
+      </div>
+      <div class="card-content">
+        <div class="login-decor">
+          <pre id="ascii-decor">
+   ______ ___      ______                   
+  / ____/|__ \    / ____/___  ____   _____ _
+ / /     __/ /   / /   / __ \/ __ \ / ___/(_)
+/ /___  / __/_  / /___/ /_/ / / / // /   _  
+\____/ /____/(_)\____/\____/_/ /_//_/   (_) 
+          </pre>
+        </div>
+        
+        <div class="auth-box">
+        <div class="section-title" id="auth-title">Login</div>
+        <form id="auth-form" class="c2-form">
+          <input type="hidden" id="auth-mode" value="login">
+          
+          <!-- Decoy Honeypot field for bot/AI trapping -->
+          <div style="position: absolute; left: -9999px; width: 1px; height: 1px; overflow: hidden;">
+            <label for="agent-email">Email validation</label>
+            <input type="text" id="agent-email" name="email" autocomplete="off" tabIndex="-1">
+          </div>
+
+          <div class="form-group">
+            <label for="agent-alias">Username</label>
+            <input type="text" id="agent-alias" required placeholder="username">
+          </div>
+          <div class="form-group">
+            <label for="agent-key">Password</label>
+            <input type="password" id="agent-key" required placeholder="********">
+          </div>
+
+          <!-- Custom CAPTCHA UI -->
+          <div id="captcha-container" class="hide" style="margin-top: 15px;">
+            <div style="display: flex; gap: 10px; align-items: center; margin-bottom: 10px;">
+              <img id="captcha-img" src="" alt="CAPTCHA Challenge" style="border: 1px solid #111; height: 50px; width: 150px; background: #050505;">
+              <button type="button" id="btn-refresh-captcha" class="c2-btn" style="height: 50px; padding: 0 15px;">🔄</button>
+            </div>
+            <div class="form-group">
+              <label for="captcha-input">CAPTCHA Code</label>
+              <input type="text" id="captcha-input" placeholder="Enter code" autocomplete="off">
+            </div>
+            <div id="pow-status" style="font-size: 10px; color: #83e635; margin-top: 5px; font-family: monospace;">
+              PoW State: Idle
+            </div>
+          </div>
+
+          <button type="submit" id="auth-submit-btn" class="c2-btn block-btn" style="margin-top: 15px;">Login</button>
+        </form>
+        <div class="auth-toggle-bar" style="margin-top: 15px; font-size: 11px;">
+          <span id="toggle-auth-login" class="action-link active">Login</span>
+          <span style="color:#222;margin:0 8px;">|</span>
+          <span id="toggle-auth-register" class="action-link">Register</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

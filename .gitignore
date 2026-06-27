@@ -1,0 +1,12 @@
+node_modules/
+data/
+.env
+cloudflared/
+deploy.bat
+credentials.txt
+*.log
+.agents/
+documentation/
+.gemini/
+*.sqlite
+*.db
