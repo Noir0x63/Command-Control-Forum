@@ -262,8 +262,8 @@ async function initCommander() {
   await new Promise((resolve, reject) => {
     db.run(
       `INSERT INTO users
-         (codename, password_hash, public_key_spki, encrypted_private_key, role, bio, joined_date)
-       VALUES (?, ?, ?, ?, 'COMMANDER', 'COMMANDER NODE INITIALIZED.', ?)`,
+         (codename, password_hash, public_key_spki, encrypted_private_key, role, status, bio, joined_date)
+       VALUES (?, ?, ?, ?, 'COMMANDER', 'ACTIVE', 'COMMANDER NODE INITIALIZED.', ?)`,
       [codename, passwordHash, publicKeySPKI, encryptedPrivateKey, joinedDate],
       (err) => { if (err) reject(err); else resolve(); }
     );

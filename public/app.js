@@ -183,43 +183,67 @@ class CryptoEngine {
 // ─── IndexedDB Keystore ───────────────────────────────────────────────────────
 
 class IDBKeystore {
+  static inMemoryDB = new Map();
+
   static async openDB() {
+    if (typeof indexedDB === 'undefined') {
+      throw new Error('IndexedDB not supported');
+    }
     return new Promise((resolve, reject) => {
-      const request = indexedDB.open('C2Keystore', 1);
-      request.onupgradeneeded = () => request.result.createObjectStore('keys');
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
+      try {
+        const request = indexedDB.open('C2Keystore', 1);
+        request.onupgradeneeded = () => request.result.createObjectStore('keys');
+        request.onsuccess = () => resolve(request.result);
+        request.onerror = () => reject(request.error || new Error('IndexedDB open error'));
+      } catch (e) {
+        reject(e);
+      }
     });
   }
 
   static async setKey(name, cryptoKey) {
-    const db = await this.openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction('keys', 'readwrite');
-      tx.objectStore('keys').put(cryptoKey, name);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
+    try {
+      const db = await this.openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('keys', 'readwrite');
+        tx.objectStore('keys').put(cryptoKey, name);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (e) {
+      console.warn('[C2 Keystore] IndexedDB write failed, falling back to memory:', e);
+      this.inMemoryDB.set(name, cryptoKey);
+    }
   }
 
   static async getKey(name) {
-    const db = await this.openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction('keys', 'readonly');
-      const req = tx.objectStore('keys').get(name);
-      req.onsuccess = () => resolve(req.result);
-      req.onerror = () => reject(req.error);
-    });
+    try {
+      const db = await this.openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('keys', 'readonly');
+        const req = tx.objectStore('keys').get(name);
+        req.onsuccess = () => resolve(req.result);
+        req.onerror = () => reject(req.error);
+      });
+    } catch (e) {
+      console.warn('[C2 Keystore] IndexedDB read failed, falling back to memory:', e);
+      return this.inMemoryDB.get(name) || null;
+    }
   }
 
   static async clearKey(name) {
-    const db = await this.openDB();
-    return new Promise((resolve, reject) => {
-      const tx = db.transaction('keys', 'readwrite');
-      tx.objectStore('keys').delete(name);
-      tx.oncomplete = () => resolve();
-      tx.onerror = () => reject(tx.error);
-    });
+    try {
+      const db = await this.openDB();
+      return new Promise((resolve, reject) => {
+        const tx = db.transaction('keys', 'readwrite');
+        tx.objectStore('keys').delete(name);
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+      });
+    } catch (e) {
+      console.warn('[C2 Keystore] IndexedDB delete failed, falling back to memory:', e);
+      this.inMemoryDB.delete(name);
+    }
   }
 }
 
@@ -234,7 +258,12 @@ class ApiService {
   async #fetchJSON(url, options = {}) {
     const res  = await fetch(url, options);
     const data = await res.json();
-    if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+    if (!res.ok) {
+      const err = new Error(data.error ?? `HTTP ${res.status}`);
+      err.status = data.status;
+      err.attempts_left = data.attempts_left;
+      throw err;
+    }
     return data;
   }
 
@@ -280,6 +309,27 @@ class ApiService {
       method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body:    JSON.stringify({ codename, password }),
+    });
+  }
+
+  acceptTerms() {
+    return this.#fetchJSON(`${API_BASE}/auth/terms/accept`, {
+      method: 'POST',
+      headers: this.#getAuthHeaders(),
+    });
+  }
+
+  getGatekeeperChallenge() {
+    return this.#fetchJSON(`${API_BASE}/auth/admission/challenge`, {
+      headers: this.#getAuthHeaders(),
+    });
+  }
+
+  evaluateGatekeeperChallenge(answers) {
+    return this.#fetchJSON(`${API_BASE}/auth/admission/evaluate`, {
+      method: 'POST',
+      headers: { ...this.#getAuthHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answers })
     });
   }
 
@@ -545,7 +595,7 @@ class AppState {
       captchaIssuedAt,
       ...registerBody,
     });
-    await this.login(codename, passphrase);
+    return await this.login(codename, passphrase);
   }
 
   async login(codename, passphrase) {
@@ -575,13 +625,24 @@ class AppState {
       console.warn('[C2 Keystore] No encrypted private key returned from server.');
     }
 
+    if (data.status === 'PENDING_ADMISSION') {
+      console.log('[C2 Auth] Agent pending admission. Launching Gatekeeper protocol.');
+      this.notify();
+      return 'PENDING_ADMISSION';
+    }
+
     this.initSocket();
     this.notify();
+    return 'ACTIVE';
   }
 
   async logout() {
     // Revoke token on server (best-effort), then clear local state
-    await this.api.logout();
+    try {
+      await this.api.logout();
+    } catch (e) {
+      console.warn('[C2 Auth] Server-side logout failed:', e);
+    }
     this.currentAgent     = null;
     this.activePrivateKey = null;
     localStorage.removeItem('c2_auth_agent');
@@ -819,6 +880,7 @@ class UIController {
     this.secProfile = document.getElementById('profile-view');
 
     this.btnNavFeed      = document.getElementById('nav-btn-feed');
+    this.btnNavAdmission = document.getElementById('nav-btn-admission');
     this.btnNavProfile   = document.getElementById('nav-btn-profile');
     this.btnLogin        = document.getElementById('btn-login');
     this.btnNewThread    = document.getElementById('btn-new-thread');
@@ -834,6 +896,8 @@ class UIController {
     this.formReply        = document.getElementById('reply-form');
     this.replyRestrictedMsg = document.getElementById('reply-restricted-info');
     this.formProfile      = document.getElementById('profile-settings-form');
+    this.profileAdmissionBox = document.getElementById('profile-admission-box');
+    this.btnProfileAdmission  = document.getElementById('btn-profile-admission');
     this.captchaContainer = document.getElementById('captcha-container');
     this.captchaImg       = document.getElementById('captcha-img');
     this.captchaInput     = document.getElementById('captcha-input');
@@ -887,6 +951,60 @@ class UIController {
     // ─── PURE EVENT DELEGATION ────────────────────────────────────────────────
 
     this.btnNavFeed.addEventListener('click',    () => this.state.setView('feed'));
+    this.btnNavAdmission.addEventListener('click', async () => {
+      console.log('[C2 UI] btnNavAdmission clicked.');
+      const agent = this.state.currentAgent;
+      console.log('[C2 UI] currentAgent:', agent);
+      if (!agent) return;
+      try {
+        const user = await this.api.getUser(agent);
+        console.log('[C2 UI] User profile retrieved:', user);
+        console.log('[C2 UI] user.status:', user.status);
+        console.log('[C2 UI] user.terms_accepted_at:', user.terms_accepted_at);
+        if (user.status === 'PENDING_ADMISSION') {
+          if (user.terms_accepted_at) {
+            console.log('[C2 UI] Terms already accepted. Starting gatekeeper flow.');
+            this.#startGatekeeperFlow();
+          } else {
+            console.log('[C2 UI] Terms not accepted. Displaying terms modal.');
+            this.#showTermsModalDirect();
+          }
+        } else {
+          console.log('[C2 UI] User is not pending admission.');
+        }
+      } catch (err) {
+        console.error('[C2 UI] Admission button retrieval failed:', err);
+        alert('Failed to retrieve admission status: ' + err.message);
+      }
+    });
+
+    this.btnProfileAdmission.addEventListener('click', async () => {
+      console.log('[C2 UI] btnProfileAdmission clicked.');
+      const agent = this.state.currentAgent;
+      console.log('[C2 UI] currentAgent:', agent);
+      if (!agent) return;
+      try {
+        const user = await this.api.getUser(agent);
+        console.log('[C2 UI] User profile retrieved:', user);
+        console.log('[C2 UI] user.status:', user.status);
+        console.log('[C2 UI] user.terms_accepted_at:', user.terms_accepted_at);
+        if (user.status === 'PENDING_ADMISSION') {
+          if (user.terms_accepted_at) {
+            console.log('[C2 UI] Terms already accepted. Starting gatekeeper flow.');
+            this.#startGatekeeperFlow();
+          } else {
+            console.log('[C2 UI] Terms not accepted. Displaying terms modal.');
+            this.#showTermsModalDirect();
+          }
+        } else {
+          console.log('[C2 UI] User is not pending admission.');
+        }
+      } catch (err) {
+        console.error('[C2 UI] Admission button retrieval failed:', err);
+        alert('Failed to retrieve admission status: ' + err.message);
+      }
+    });
+
     this.btnNavProfile.addEventListener('click', () => this.state.setView('profile'));
     this.btnBackProfile.addEventListener('click',() => this.state.setView('feed'));
 
@@ -993,31 +1111,34 @@ class UIController {
       btn.textContent = 'PROCESSING...';
 
       try {
+        let status;
         if (mode === 'register') {
           const captchaVal = this.captchaInput.value.trim();
           if (!this.powSolvedSalt) {
             throw new Error('Proof of Work challenge not solved yet.');
           }
 
-          // C2-004: Build dynamic honeypot field values for submission.
-          // All honeypot fields SHOULD be empty (human won't see them).
-          // We send them as empty strings so the server can verify they're unfilled.
           const honeypotValues = {};
           for (const name of this.honeypotFieldNames) {
             const el = document.querySelector(`[name="${name}"]`);
             honeypotValues[name] = el ? el.value : '';
           }
 
-          await this.state.register(
+          status = await this.state.register(
             alias, secret,
             captchaVal, this.captchaToken, this.powChallenge, this.powSolvedSalt,
             honeypotValues, this.hpToken, this.captchaIssuedAt
           );
         } else {
-          await this.state.login(alias, secret);
+          status = await this.state.login(alias, secret);
         }
+        
         this.modalLogin.classList.remove('active');
         document.getElementById('auth-form').reset();
+        
+        if (status === 'PENDING_ADMISSION') {
+            this.#showTermsModalDirect();
+        }
       } catch (err) {
         console.error('[C2 Portal Exception]', err);
         alert(`Authentication Error: ${err.message}`);
@@ -1216,6 +1337,7 @@ class UIController {
     } else {
       this.btnLogin.textContent = '◇ login';
       this.btnNavProfile.classList.add('hide');
+      this.btnNavAdmission.classList.add('hide');
       this.btnNewThread.setAttribute('disabled', 'true');
       this.formReply.classList.add('hide');
       this.replyRestrictedMsg.classList.remove('hide');
@@ -1227,14 +1349,41 @@ class UIController {
     const targetProfile = state.selectedProfileCodename || agent;
     if (targetProfile) {
       try {
+        const isViewingOwnProfile = agent && targetProfile.toLowerCase() === agent.toLowerCase();
+        
+        // Single getUser call for the target profile; if viewing own profile,
+        // this also provides the data needed for admission/gatekeeper checks.
         const userObj = await this.api.getUser(targetProfile);
         
         let isCommander = false;
+        let admissionUser = null;
         if (agent) {
-          try {
-            const loggedInUser = await this.api.getUser(agent);
-            isCommander = loggedInUser.role === 'COMMANDER';
-          } catch {}
+          admissionUser = isViewingOwnProfile ? userObj : await this.api.getUser(agent);
+          isCommander = admissionUser.role === 'COMMANDER';
+          
+          if (admissionUser.status === 'PENDING_ADMISSION') {
+              console.log('[C2 UI] PENDING_ADMISSION detected — showing admission flow. terms_accepted_at:', admissionUser.terms_accepted_at);
+              if (admissionUser.terms_accepted_at) {
+                this.#startGatekeeperFlow();
+              } else {
+                this.#showTermsModalDirect();
+              }
+              // Block feed/profile rendering while pending admission
+              this.secFeed.classList.remove('active');
+              this.secDetail.classList.remove('active');
+              this.secCreate.classList.remove('active');
+              this.secProfile.classList.remove('active');
+              return;
+          }
+
+          // Admission button visibility (only for own profile)
+          if (isViewingOwnProfile) {
+            if (admissionUser.status === 'PENDING_ADMISSION') {
+              this.btnNavAdmission.classList.remove('hide');
+            } else {
+              this.btnNavAdmission.classList.add('hide');
+            }
+          }
         }
         
         const isOwnProfile = agent && targetProfile.toLowerCase() === agent.toLowerCase();
@@ -1243,7 +1392,10 @@ class UIController {
         this.profRole.textContent     = userObj.role;
         this.profJoined.textContent   = userObj.joined_date;
         this.profReputation.textContent = userObj.reputation;
-        this.profBio.value            = userObj.bio;
+        // Only update bio field if user is not actively editing it
+        if (document.activeElement !== this.profBio) {
+          this.profBio.value = userObj.bio;
+        }
         this.profPubKey.value         =
           `-----BEGIN PUBLIC KEY-----\n${userObj.public_key_spki.match(/.{1,64}/g).join('\n')}\n-----END PUBLIC KEY-----`;
 
@@ -1256,12 +1408,18 @@ class UIController {
           if (securityDesc) {
             securityDesc.textContent = 'Your private signing key is stored encrypted on the server (AES-256-GCM). It is decrypted locally in your browser when you login using your password.';
           }
+          if (userObj.status === 'PENDING_ADMISSION') {
+            this.profileAdmissionBox.classList.remove('hide');
+          } else {
+            this.profileAdmissionBox.classList.add('hide');
+          }
         } else {
           if (saveBioBtn) saveBioBtn.classList.add('hide');
           this.profBio.setAttribute('readonly', 'true');
           if (securityDesc) {
             securityDesc.textContent = 'Public key used to verify signatures from this node.';
           }
+          this.profileAdmissionBox.classList.add('hide');
         }
 
         // Render dynamic moderation console if logged-in user is a COMMANDER
@@ -1417,7 +1575,7 @@ class UIController {
       });
     } catch (err) {
       console.error('[C2 Feed Engine] Fetch failed:', err);
-      this.elThreadFeed.innerHTML = '<div class="restricted-info">Offline. Server unreachable.</div>';
+      this.elThreadFeed.innerHTML = '<div class="restricted-info">Offline. Server unreachable or Admission pending.</div>';
       return;
     }
 
@@ -1780,10 +1938,277 @@ class UIController {
       cHeader.append(cLeft, cRight);
       // Reply content — rendered with Markdown/LaTeX securely
       const cBody = renderFormattedContent(reply.content);
-      cBody.className = 'comment-body';
+          cBody.className = 'comment-body';
       commentDiv.append(cHeader, cBody);
       this.elCommentsList.appendChild(commentDiv);
     }
+  }
+
+  async #startGatekeeperFlow() {
+    if (document.getElementById('diag-gatekeeper-modal')) return;
+    console.log('[C2 UI] #startGatekeeperFlow initiated.');
+
+    const baseStyle = (el, css) => { for (const [k, v] of Object.entries(css)) el.style[k] = v; };
+
+    // Overlay
+    const overlay = document.createElement('div');
+    overlay.id = 'diag-gatekeeper-modal';
+    baseStyle(overlay, {
+      position:'fixed', top:'0', left:'0', width:'100vw', height:'100vh',
+      background:'rgba(0,0,0,0.95)', display:'flex', alignItems:'center',
+      justifyContent:'center', zIndex:'2147483647', fontFamily:'monospace'
+    });
+
+    // Card container
+    const card = document.createElement('div');
+    baseStyle(card, {
+      background:'#000', border:'1px solid #fff', maxWidth:'800px',
+      width:'90%', color:'#fff', display:'flex', flexDirection:'column'
+    });
+
+    // Header
+    const header = document.createElement('div');
+    baseStyle(header, { padding:'10px 14px', borderBottom:'1px solid #333' });
+    const headerSpan = document.createElement('span');
+    baseStyle(headerSpan, { fontSize:'10px', color:'#fff', fontWeight:'bold' });
+    headerSpan.textContent = 'AI-GATEKEEPER ADMISSION TERMINAL';
+    header.appendChild(headerSpan);
+
+    // Content area
+    const content = document.createElement('div');
+    baseStyle(content, { padding:'20px', minHeight:'200px' });
+
+    // Status line
+    const statusLine = document.createElement('div');
+    statusLine.id = 'diag-gk-status';
+    baseStyle(statusLine, { color:'#58a6ff', marginBottom:'20px', fontSize:'11px' });
+    statusLine.textContent = '[SYS] Initializing admission protocol... [SYS] Connection established.';
+
+    // Question box
+    const questionBox = document.createElement('div');
+    questionBox.id = 'diag-gk-question';
+    baseStyle(questionBox, {
+      background:'#050505', border:'1px solid #333', padding:'15px',
+      marginBottom:'20px', color:'#e6e6e6', whiteSpace:'pre-wrap', fontSize:'13px'
+    });
+    questionBox.textContent = 'Fetching challenge...';
+
+    // Input wrapper (dynamic content goes here)
+    const inputWrapper = document.createElement('div');
+    inputWrapper.id = 'diag-gk-input-wrapper';
+    baseStyle(inputWrapper, { marginBottom:'15px' });
+
+    // Footer row
+    const footer = document.createElement('div');
+    baseStyle(footer, { display:'flex', justifyContent:'space-between', alignItems:'center' });
+
+    const attemptsSpan = document.createElement('span');
+    attemptsSpan.id = 'diag-gk-attempts';
+    baseStyle(attemptsSpan, { fontSize:'12px', color:'#f85149' });
+    attemptsSpan.textContent = 'Attempts remaining: 5';
+
+    const submitBtn = document.createElement('button');
+    submitBtn.id = 'diag-gk-submit';
+    baseStyle(submitBtn, {
+      padding:'10px 20px', background:'#000', color:'#fff',
+      border:'1px solid #fff', cursor:'pointer', fontFamily:'monospace',
+      fontSize:'11px', textTransform:'uppercase'
+    });
+    submitBtn.textContent = '[ SUBMIT ANSWERS ]';
+
+    footer.appendChild(attemptsSpan);
+    footer.appendChild(submitBtn);
+
+    content.appendChild(statusLine);
+    content.appendChild(questionBox);
+    content.appendChild(inputWrapper);
+    content.appendChild(footer);
+
+    card.appendChild(header);
+    card.appendChild(content);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
+
+    // Dynamic content references (keep names matching the logic below)
+    const questionEl = questionBox;
+    const attemptsEl = attemptsSpan;
+
+    try {
+      const challenge = await this.api.getGatekeeperChallenge();
+      questionEl.textContent = 'Complete the following admission challenges:';
+      inputWrapper.innerHTML = '';
+
+      for (const q of challenge.questions) {
+        const qCard = document.createElement('div');
+        baseStyle(qCard, { border:'1px solid #333', padding:'12px', marginBottom:'12px' });
+
+        const qText = document.createElement('div');
+        baseStyle(qText, { fontSize:'12px', color:'#e6e6e6', marginBottom:'8px', lineHeight:'1.5' });
+        qText.textContent = q.question;
+        qCard.appendChild(qText);
+
+        q.options.forEach((opt, idx) => {
+          const label = document.createElement('label');
+          baseStyle(label, { display:'block', marginBottom:'4px', fontSize:'11px', cursor:'pointer' });
+          const input = document.createElement('input');
+          input.type = 'radio';
+          input.name = 'diag-gk-' + q.id;
+          input.value = String.fromCharCode(65 + idx);
+          input.style.marginRight = '6px';
+          label.appendChild(input);
+          label.appendChild(document.createTextNode(' ' + opt));
+          qCard.appendChild(label);
+        });
+        inputWrapper.appendChild(qCard);
+      }
+
+      submitBtn.disabled = false;
+
+      submitBtn.onclick = async () => {
+        const answers = {};
+        let allAnswered = true;
+        for (const q of challenge.questions) {
+          const checked = document.querySelector(`input[name="diag-gk-${q.id}"]:checked`);
+          if (!checked) { allAnswered = false; break; }
+          answers[q.id] = checked.value;
+        }
+        if (!allAnswered) {
+          alert('You must answer both questions before submitting.');
+          return;
+        }
+        try {
+          const res = await this.api.evaluateGatekeeperChallenge(answers);
+          if (res.status === 'ACTIVE') {
+            overlay.remove();
+            this.state.initSocket();
+            this.state.notify();
+            alert('ADMISSION APPROVED. Welcome.');
+          }
+        } catch (err) {
+          attemptsEl.textContent = 'Attempts remaining: ' + (err.attempts_left !== undefined ? err.attempts_left : '-');
+          alert('ADMISSION REJECTED: ' + err.message);
+        }
+      };
+    } catch(err) {
+      questionEl.textContent = 'Error connecting to Arbiter: ' + err.message;
+    }
+  }
+
+  #showTermsModalDirect() {
+    if (document.getElementById('diag-fallback-modal')) return;
+
+    const baseStyle = (el, css) => { for (const [k, v] of Object.entries(css)) el.style[k] = v; };
+    const appendAll = (parent, ...children) => { children.forEach(c => parent.appendChild(c)); };
+
+    // Overlay
+    const overlay = document.createElement('div');
+    overlay.id = 'diag-fallback-modal';
+    baseStyle(overlay, {
+      position:'fixed', top:'0', left:'0', width:'100vw', height:'100vh',
+      background:'rgba(0,0,0,0.95)', display:'flex', alignItems:'center',
+      justifyContent:'center', zIndex:'2147483647', fontFamily:'monospace'
+    });
+
+    // Card container
+    const card = document.createElement('div');
+    baseStyle(card, {
+      background:'#000', border:'1px solid #fff', maxWidth:'600px',
+      width:'90%', color:'#fff', display:'flex', flexDirection:'column'
+    });
+
+    // Header
+    const header = document.createElement('div');
+    baseStyle(header, { padding:'10px 14px', borderBottom:'1px solid #1a1a1a' });
+    const headerSpan = document.createElement('span');
+    baseStyle(headerSpan, { fontSize:'10px', color:'#fff', fontWeight:'bold' });
+    headerSpan.textContent = 'ACTION REQUIRED: LEGAL ACCEPTANCE';
+    header.appendChild(headerSpan);
+
+    // Content wrapper
+    const content = document.createElement('div');
+    baseStyle(content, { padding:'20px' });
+
+    // Title
+    const h3 = document.createElement('h3');
+    baseStyle(h3, { color:'#ff3333', margin:'0 0 12px 0', fontSize:'12px', fontWeight:'bold' });
+    h3.textContent = 'RESTRICTED ACCESS ZONE';
+
+    // Paragraph 1 (with <strong>)
+    const p1 = document.createElement('p');
+    baseStyle(p1, { fontSize:'12px', lineHeight:'1.6', margin:'0 0 12px 0' });
+    p1.appendChild(document.createTextNode('You are attempting to enter a restricted cybersecurity research forum. By proceeding, you agree to assume '));
+    const strong1 = document.createElement('strong');
+    strong1.textContent = 'full civil and criminal liability';
+    p1.appendChild(strong1);
+    p1.appendChild(document.createTextNode(' for any content, payloads, or signatures you post.'));
+
+    // Paragraph 2
+    const p2 = document.createElement('p');
+    baseStyle(p2, { fontSize:'12px', lineHeight:'1.6', margin:'0 0 12px 0' });
+    p2.textContent = 'This platform operates strictly on an "As Is" basis. The operators are legally exempt from any liability regarding User-Generated Content (UGC).';
+
+    // Link to terms
+    const linkDiv = document.createElement('div');
+    baseStyle(linkDiv, { margin:'16px 0' });
+    const linkA = document.createElement('a');
+    baseStyle(linkA, { color:'#00ff66', fontSize:'11px', textDecoration:'underline' });
+    linkA.href = '/terms.html';
+    linkA.target = '_blank';
+    linkA.textContent = '[ READ FULL TERMS AND CONDITIONS ]';
+    linkDiv.appendChild(linkA);
+
+    // Buttons container
+    const btnDiv = document.createElement('div');
+    baseStyle(btnDiv, { display:'flex', gap:'15px', marginTop:'20px' });
+
+    const btnStyle = {
+      flex:'1', padding:'8px', background:'#000', cursor:'pointer',
+      fontFamily:'monospace', fontSize:'10px', textTransform:'uppercase',
+      transition:'all 0.1s', border:'1px solid #333'
+    };
+
+    // Cancel button
+    const cancelBtn = document.createElement('button');
+    cancelBtn.id = 'diag-terms-cancel';
+    baseStyle(cancelBtn, { ...btnStyle, color:'#ff3333' });
+    cancelBtn.textContent = '[ CANCEL & LOGOUT ]';
+    cancelBtn.addEventListener('mouseenter', () => {
+      cancelBtn.style.borderColor = '#ff3333';
+      cancelBtn.style.background = '#ff3333';
+      cancelBtn.style.color = '#000';
+    });
+    cancelBtn.addEventListener('mouseleave', () => {
+      cancelBtn.style.borderColor = '#333';
+      cancelBtn.style.background = '#000';
+      cancelBtn.style.color = '#ff3333';
+    });
+    cancelBtn.addEventListener('click', () => { overlay.remove(); this.state.logout(); });
+
+    // Accept button
+    const acceptBtn = document.createElement('button');
+    acceptBtn.id = 'diag-terms-accept';
+    baseStyle(acceptBtn, { ...btnStyle, color:'#fff' });
+    acceptBtn.textContent = '[ I ACCEPT FULL RESPONSIBILITY ]';
+    acceptBtn.addEventListener('mouseenter', () => {
+      acceptBtn.style.borderColor = '#fff';
+      acceptBtn.style.background = '#fff';
+      acceptBtn.style.color = '#000';
+    });
+    acceptBtn.addEventListener('mouseleave', () => {
+      acceptBtn.style.borderColor = '#333';
+      acceptBtn.style.background = '#000';
+      acceptBtn.style.color = '#fff';
+    });
+    acceptBtn.addEventListener('click', async () => {
+      try { await this.api.acceptTerms(); overlay.remove(); this.#startGatekeeperFlow(); }
+      catch(e) { alert('Error: ' + e.message); }
+    });
+
+    appendAll(btnDiv, cancelBtn, acceptBtn);
+    appendAll(content, h3, p1, p2, linkDiv, btnDiv);
+    appendAll(card, header, content);
+    overlay.appendChild(card);
+    document.body.appendChild(overlay);
   }
 }
 

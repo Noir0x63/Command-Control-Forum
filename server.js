@@ -85,6 +85,10 @@ db.serialize(() => {
       public_key_spki      TEXT NOT NULL,
       encrypted_private_key TEXT,
       role                 TEXT NOT NULL DEFAULT 'AGENT',
+      status               TEXT NOT NULL DEFAULT 'PENDING_ADMISSION',
+      admission_attempts   INTEGER NOT NULL DEFAULT 5,
+      terms_accepted_at    TEXT,
+      terms_accepted_ip    TEXT,
       bio                  TEXT NOT NULL DEFAULT 'INITIALIZED AGENT NODE.',
       joined_date          TEXT NOT NULL,
       last_seen            INTEGER DEFAULT 0
@@ -95,6 +99,11 @@ db.serialize(() => {
   db.run("ALTER TABLE users ADD COLUMN last_seen INTEGER DEFAULT 0", (err) => {
     // Silent catch if column is already present
   });
+
+  db.run("ALTER TABLE users ADD COLUMN status TEXT NOT NULL DEFAULT 'PENDING_ADMISSION'", () => {});
+  db.run("ALTER TABLE users ADD COLUMN admission_attempts INTEGER NOT NULL DEFAULT 5", () => {});
+  db.run("ALTER TABLE users ADD COLUMN terms_accepted_at TEXT", () => {});
+  db.run("ALTER TABLE users ADD COLUMN terms_accepted_ip TEXT", () => {});
 
   db.run(`
     CREATE TABLE IF NOT EXISTS threads (
@@ -186,6 +195,44 @@ db.serialize(() => {
     )
   `);
   db.run('CREATE INDEX IF NOT EXISTS idx_nonces_created_at ON nonces(created_at)');
+
+  // Admission gatekeeper question pool
+  db.run(`
+    CREATE TABLE IF NOT EXISTS admission_questions (
+      id             INTEGER PRIMARY KEY AUTOINCREMENT,
+      question       TEXT    NOT NULL,
+      options        TEXT    NOT NULL,
+      correct_answer TEXT    NOT NULL,
+      created_at     INTEGER NOT NULL
+    )
+  `, function() {
+    // Seed initial questions if table is empty
+    db.get('SELECT COUNT(*) AS cnt FROM admission_questions', [], (err, row) => {
+      if (err || row.cnt > 0) return;
+      const seedQuestions = [
+        { q: '¿Qué ataque consiste en engañar a un usuario para que haga clic en algo diferente de lo que percibe?', opts: ['A) Phishing', 'B) Clickjacking', 'C) Spoofing', 'D) SMiShing'], ans: 'B' },
+        { q: '¿Cuál es el puerto predeterminado para conexiones HTTPS?', opts: ['A) 80', 'B) 22', 'C) 443', 'D) 8080'], ans: 'C' },
+        { q: '¿Qué principio de seguridad establece que un usuario debe tener solo los permisos mínimos necesarios para realizar su trabajo?', opts: ['A) Defensa en profundidad', 'B) Superficie de ataque mínima', 'C) Privilegio mínimo', 'D) Separación de privilegios'], ans: 'C' },
+        { q: '¿Qué tipo de ataque consiste en insertar código malicioso en una consulta a una base de datos?', opts: ['A) XSS', 'B) CSRF', 'C) SQL Injection', 'D) MITM'], ans: 'C' },
+        { q: '¿Qué protocolo se utiliza para transferir archivos de forma segura sobre SSH?', opts: ['A) FTP', 'B) TFTP', 'C) SFTP', 'D) FTPS'], ans: 'C' },
+        { q: '¿Cuál es la diferencia entre autenticación y autorización?', opts: ['A) Son lo mismo', 'B) Autenticación verifica identidad; autorización verifica permisos', 'C) Autorización verifica identidad; autenticación verifica permisos', 'D) Ninguna de las anteriores'], ans: 'B' },
+        { q: '¿Qué es un ataque de hombre en el medio (MITM)?', opts: ['A) Infectar un servidor con malware', 'B) Interceptar la comunicación entre dos partes sin su conocimiento', 'C) Enviar correos fraudulentos para robar información', 'D) Saturar un servidor con tráfico'], ans: 'B' },
+        { q: '¿Qué cifrado de los siguientes es SIMÉTRICO?', opts: ['A) RSA', 'B) ECDSA', 'C) AES', 'D) Diffie-Hellman'], ans: 'C' },
+        { q: '¿Qué header HTTP ayuda a prevenir ataques de clickjacking?', opts: ['A) Strict-Transport-Security', 'B) Content-Security-Policy', 'C) X-Frame-Options', 'D) X-Content-Type-Options'], ans: 'C' },
+        { q: '¿Qué es un honeypot en seguridad informática?', opts: ['A) Un tipo de firewall', 'B) Un señuelo para atraer y detectar atacantes', 'C) Un algoritmo de cifrado', 'D) Un protocolo de autenticación'], ans: 'B' },
+        { q: '¿Cuál de los siguientes es un ejemplo de autenticación multifactor (MFA)?', opts: ['A) Usuario y contraseña', 'B) Contraseña + código de app autenticadora', 'C) Pregunta de seguridad', 'D) Token de API'], ans: 'B' },
+        { q: '¿Qué método HTTP se utiliza típicamente para crear un recurso en una API REST?', opts: ['A) GET', 'B) POST', 'C) PUT', 'D) DELETE'], ans: 'B' },
+        { q: '¿Qué es Cross-Site Scripting (XSS)?', opts: ['A) Robar la sesión de un usuario mediante cookies', 'B) Inyectar scripts maliciosos en páginas web vistas por otros usuarios', 'C) Modificar el DNS de un dominio', 'D) Interceptar tráfico de red'], ans: 'B' },
+        { q: '¿Cuál es el propósito de un firewall de red?', opts: ['A) Acelerar la conexión a internet', 'B) Monitorear y bloquear tráfico no autorizado según reglas definidas', 'C) Cifrar toda la comunicación de red', 'D) Almacenar contraseñas de forma segura'], ans: 'B' },
+        { q: '¿Qué puerto usa el protocolo SSH?', opts: ['A) 21', 'B) 22', 'C) 23', 'D) 25'], ans: 'B' },
+      ];
+      const now = Date.now();
+      for (const q of seedQuestions) {
+        db.run('INSERT INTO admission_questions (question, options, correct_answer, created_at) VALUES (?, ?, ?, ?)', [q.q, JSON.stringify(q.opts), q.ans, now]);
+      }
+      console.log('[OK] Seeded', seedQuestions.length, 'admission questions.');
+    });
+  });
 
   // Phase 3 Schema Additions (Fail-safe for existing tables)
   db.run("ALTER TABLE threads ADD COLUMN client_nonce TEXT", () => {});
@@ -441,11 +488,11 @@ function validateFreshness(nonce, timestamp) {
 function authenticateToken(req, res, next) {
   const cookies = req.headers.cookie ? Object.fromEntries(req.headers.cookie.split('; ').map(c => c.split('='))) : {};
   const header = req.headers['authorization'];
-  const token  = cookies.token || (header?.startsWith('Bearer ') ? header.slice(7) : null);
+  const token  = (header?.startsWith('Bearer ') ? header.slice(7) : null) || cookies.token;
   if (!token) return res.status(401).json({ error: 'Authentication required.' });
 
   db.get(
-    'SELECT s.codename, s.expires_at, m.status FROM sessions s LEFT JOIN moderation m ON s.codename = m.codename WHERE s.token = ?',
+    'SELECT s.codename, s.expires_at, u.status AS account_status, m.status AS mod_status, u.role FROM sessions s JOIN users u ON s.codename = u.codename LEFT JOIN moderation m ON s.codename = m.codename WHERE s.token = ?',
     [token],
     (err, session) => {
       if (err || !session) return res.status(403).json({ error: 'Invalid session.' });
@@ -453,16 +500,28 @@ function authenticateToken(req, res, next) {
         db.run('DELETE FROM sessions WHERE token = ?', [token]);
         return res.status(403).json({ error: 'Session expired. Re-authenticate.' });
       }
-      if (session.status === 'BANNED') {
+      if (session.mod_status === 'BANNED') {
         db.run('DELETE FROM sessions WHERE token = ?', [token]);
         return res.status(403).json({ error: 'Access denied. Account is banned.' });
       }
       req.userCodename = session.codename;
+      req.accountStatus = session.account_status;
+      req.userRole = session.role;
       // Async update last_seen activity timestamp
       db.run('UPDATE users SET last_seen = ? WHERE codename = ?', [Date.now(), session.codename]);
       next();
     }
   );
+}
+
+function requireActiveAdmission(req, res, next) {
+  if (req.userRole === 'COMMANDER') {
+    return next();
+  }
+  if (req.accountStatus === 'PENDING_ADMISSION') {
+    return res.status(403).json({ error: 'Admission pending. Complete the entrance challenge to access this endpoint.', status: 'PENDING_ADMISSION' });
+  }
+  next();
 }
 
 function requireCommander(req, res, next) {
@@ -492,19 +551,20 @@ function requireCommander(req, res, next) {
 function optionalAuthenticateToken(req, res, next) {
   const cookies = req.headers.cookie ? Object.fromEntries(req.headers.cookie.split('; ').map(c => c.split('='))) : {};
   const header = req.headers['authorization'];
-  const token  = cookies.token || (header?.startsWith('Bearer ') ? header.slice(7) : null);
+  const token  = (header?.startsWith('Bearer ') ? header.slice(7) : null) || cookies.token;
   if (!token) {
     req.userCodename = null;
     return next();
   }
   db.get(
-    'SELECT codename, expires_at FROM sessions WHERE token = ?',
+    'SELECT s.codename, s.expires_at, u.status AS account_status FROM sessions s JOIN users u ON s.codename = u.codename WHERE s.token = ?',
     [token],
     (err, session) => {
       if (err || !session || Date.now() > session.expires_at) {
         req.userCodename = null;
       } else {
         req.userCodename = session.codename;
+        req.accountStatus = session.account_status;
       }
       next();
     }
@@ -538,13 +598,19 @@ io.use((socket, next) => {
   if (!token) return next(new Error('Authentication required.'));
 
   db.get(
-    'SELECT codename, expires_at FROM sessions WHERE token = ?',
+    'SELECT s.codename, s.expires_at, u.status AS account_status, m.status AS mod_status FROM sessions s JOIN users u ON s.codename = u.codename LEFT JOIN moderation m ON s.codename = m.codename WHERE s.token = ?',
     [token],
     (err, session) => {
       if (err || !session) return next(new Error('Invalid session.'));
       if (Date.now() > session.expires_at) {
         db.run('DELETE FROM sessions WHERE token = ?', [token]);
         return next(new Error('Session expired.'));
+      }
+      if (session.mod_status === 'BANNED') {
+        return next(new Error('Account banned.'));
+      }
+      if (session.account_status === 'PENDING_ADMISSION') {
+        return next(new Error('Admission pending.'));
       }
       socket.codename = session.codename;
       next();
@@ -640,19 +706,14 @@ app.use(helmet({
       defaultSrc:              ["'self'"],
       scriptSrc:               [
         "'self'",
-        "https://static.cloudflareinsights.com",
         "https://cdn.jsdelivr.net",
-        "'sha256-F6byk77cNxVzF4x4WJQiR7zH3D2ygGKe08AyULi3+mc='", // CF Web Analytics inline v1
-        "'sha256-YoblW/D7Cyj5UvFJEEIU/p9tEmLkKTTJCNus6agifSI='", // CF Web Analytics inline v2
-        "'sha256-BRHOS8D1IywhhZad5Q33iZTCKOy5HTNWiuGE7iMEtl0='", // CF Web Analytics inline v3
-        "'sha256-hReOYIe3xZB7WQieCptTnLsGLtNdJXu59uAjmftfqSE='"  // CF Web Analytics inline v4
       ],
       styleSrc:                ["'self'", "'unsafe-inline'", "https://fonts.googleapis.com", "https://cdn.jsdelivr.net"],
       imgSrc:                  ["'self'", 'data:'],
-      connectSrc:              ["'self'", "ws:", "wss:", "https://cloudflareinsights.com", "https://cdn.jsdelivr.net"],
+      connectSrc:              ["'self'", "ws:", "wss:", "https://cdn.jsdelivr.net"],
       fontSrc:                 ["'self'", "https://fonts.gstatic.com", "https://cdn.jsdelivr.net"],
       objectSrc:               ["'none'"],
-      mediaSrc:                ["'none'"],
+      mediaSrc:                ["'self'", "data:"],
       frameSrc:                ["'none'"],
       baseUri:                 ["'self'"],
       formAction:              ["'self'"],
@@ -694,6 +755,7 @@ app.use(express.static(path.join(__dirname, 'public'), {
 
 // Root → index.html
 app.get('/', (req, res) => {
+  res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
@@ -860,8 +922,8 @@ app.post('/api/auth/register',
           const joinedDate   = new Date().toISOString().substring(0, 10);
 
           db.run(
-            `INSERT INTO users (codename, password_hash, public_key_spki, encrypted_private_key, role, bio, joined_date)
-             VALUES (?, ?, ?, ?, 'AGENT', 'INITIALIZED AGENT NODE.', ?)`,
+            `INSERT INTO users (codename, password_hash, public_key_spki, encrypted_private_key, role, bio, joined_date, status, admission_attempts)
+             VALUES (?, ?, ?, ?, 'AGENT', 'INITIALIZED AGENT NODE.', ?, 'PENDING_ADMISSION', 5)`,
             [codename, passwordHash, publicKeySPKI, encryptedPrivateKey, joinedDate],
             (insertErr) => {
               if (insertErr) return res.status(500).json({ error: 'Registration failed.' });
@@ -886,14 +948,14 @@ app.post('/api/auth/login',
   (req, res) => {
     const { codename, password } = req.body;
 
-    db.get('SELECT u.*, m.status FROM users u LEFT JOIN moderation m ON u.codename = m.codename WHERE u.codename = ?', [codename], async (err, user) => {
+    db.get('SELECT u.*, m.status AS mod_status FROM users u LEFT JOIN moderation m ON u.codename = m.codename WHERE u.codename = ?', [codename], async (err, user) => {
       if (err || !user) {
         // Constant-time dummy scrypt to prevent user-enumeration via timing
         await verifyPassword(password, `v2:${'00'.repeat(32)}:${'00'.repeat(64)}`).catch(() => {});
         return res.status(401).json({ error: 'Authentication failed.' });
       }
 
-      if (user.status === 'BANNED') {
+      if (user.mod_status === 'BANNED') {
         return res.status(403).json({ error: 'Authentication failed. This account has been banned.' });
       }
 
@@ -919,6 +981,7 @@ app.post('/api/auth/login',
             res.json({
               codename:            user.codename,
               role:                user.role,
+              status:              user.status,
               token,
               encryptedPrivateKey: user.encrypted_private_key,
             });
@@ -953,9 +1016,105 @@ app.post('/api/auth/logout', authenticateToken, (req, res) => {
     res.json({ success: true });
   });
 });
+// ── Auth: Accept Terms ────────────────────────────────────────────────────────
+app.post('/api/auth/terms/accept', authenticateToken, (req, res) => {
+  const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown';
+  db.run(
+    'UPDATE users SET terms_accepted_at = ?, terms_accepted_ip = ? WHERE codename = ?',
+    [new Date().toISOString(), ip, req.userCodename],
+    (err) => {
+      if (err) return res.status(500).json({ error: 'Failed to record terms acceptance.' });
+      res.json({ success: true });
+    }
+  );
+});
+
+// ── Auth: Admission Challenge (AI Gatekeeper) ─────────────────────────────────
+const admissionLimiter = rateLimit({
+  windowMs: 24 * 60 * 60 * 1000, // 24 hrs
+  max: 3, // 3 attempts per IP per day
+  message: { error: 'Admission attempts exhausted for today.' }
+});
+
+const { generateChallenge, evaluateResponse } = require('./server/ai_evaluator.js');
+const pendingChallenges = new Map();
+
+app.get('/api/auth/admission/challenge', authenticateToken, async (req, res) => {
+  if (req.accountStatus !== 'PENDING_ADMISSION') {
+    return res.status(400).json({ error: 'User is already active.' });
+  }
+  
+  try {
+    const challenge = await generateChallenge(db);
+    pendingChallenges.set(req.userCodename, challenge);
+    res.json({
+      type: challenge.type,
+      questions: challenge.questions.map(q => ({
+        id: q.id,
+        question: q.question,
+        options: q.options,
+      })),
+    });
+  } catch (err) {
+    console.error('[ADMISSION] Challenge generation failed:', err.message);
+    res.status(500).json({ error: 'Challenge generation failed.' });
+  }
+});
+
+app.post('/api/auth/admission/evaluate', admissionLimiter, authenticateToken, async (req, res) => {
+  if (req.accountStatus !== 'PENDING_ADMISSION') {
+    return res.status(400).json({ error: 'User is already active.' });
+  }
+
+  db.get('SELECT admission_attempts FROM users WHERE codename = ?', [req.userCodename], async (err, row) => {
+    if (err || !row) return res.status(500).json({ error: 'Database error.' });
+    if (row.admission_attempts <= 0) {
+      return res.status(403).json({ error: 'No admission attempts remaining.' });
+    }
+
+    const { answers } = req.body;
+    
+    const challenge = pendingChallenges.get(req.userCodename);
+    if (!challenge) {
+      return res.status(400).json({ error: 'No active challenge. Request a new one.' });
+    }
+
+    try {
+      const evaluation = await evaluateResponse(db, challenge.questions, answers);
+
+      if (evaluation.qualified) {
+        pendingChallenges.delete(req.userCodename);
+        db.run('UPDATE users SET status = "ACTIVE" WHERE codename = ?', [req.userCodename], (updateErr) => {
+          if (updateErr) return res.status(500).json({ error: 'Failed to update status.' });
+          
+          const newToken = crypto.randomBytes(32).toString('hex');
+          const now = Date.now();
+          const expires = now + 24 * 60 * 60 * 1000;
+          
+          db.run('INSERT INTO sessions (token, codename, created_at, expires_at) VALUES (?, ?, ?, ?)', [newToken, req.userCodename, now, expires], (sessErr) => {
+             if (sessErr) return res.status(500).json({ error: 'Token refresh failed.' });
+             
+             const oldToken = req.headers.cookie ? Object.fromEntries(req.headers.cookie.split('; ').map(c => c.split('='))).token : null;
+             if (oldToken) db.run('DELETE FROM sessions WHERE token = ?', [oldToken]);
+             
+             res.cookie('token', newToken, { httpOnly: true, secure: true, sameSite: 'Strict', maxAge: 24 * 60 * 60 * 1000 });
+             res.json({ success: true, status: 'ACTIVE', token: newToken });
+          });
+        });
+      } else {
+        db.run('UPDATE users SET admission_attempts = admission_attempts - 1 WHERE codename = ?', [req.userCodename], () => {
+          res.status(400).json({ error: evaluation.reason || 'Incorrect response.', attempts_left: row.admission_attempts - 1 });
+        });
+      }
+    } catch (err) {
+      console.error('[ADMISSION] Evaluation failed:', err.message);
+      res.status(500).json({ error: 'Evaluation failed.' });
+    }
+  });
+});
 
 // ── Nodes (requires auth) ─────────────────────────────────────────────────────
-app.get('/api/nodes', authenticateToken, (req, res) => {
+app.get('/api/nodes', authenticateToken, requireActiveAdmission, (req, res) => {
   db.all('SELECT codename, joined_date, role FROM users', [], (err, rows) => {
     if (err) return res.status(500).json({ error: 'Failed to retrieve nodes.' });
     const nodes = rows.map((r) => ({
@@ -974,7 +1133,7 @@ app.get('/api/users/:codename', authenticateToken, (req, res) => {
     return res.status(400).json({ error: 'Invalid codename format.' });
   }
   db.get(
-    `SELECT codename, role, bio, joined_date, public_key_spki,
+    `SELECT codename, role, bio, joined_date, public_key_spki, status, terms_accepted_at,
             (SELECT COALESCE(SUM(v.value), 0)
              FROM   votes v
              JOIN   threads t ON v.thread_id = t.id
@@ -993,6 +1152,7 @@ app.get('/api/users/:codename', authenticateToken, (req, res) => {
 // ── Update Bio (requires auth) ────────────────────────────────────────────────
 app.put('/api/profile',
   authenticateToken,
+  requireActiveAdmission,
   validate({ bio: Validators.bio }),
   (req, res) => {
     db.run(
@@ -1066,6 +1226,7 @@ app.get('/api/threads', optionalAuthenticateToken, (req, res) => {
 app.post('/api/threads',
   writeLimiter,
   authenticateToken,
+  requireActiveAdmission,
   validate({
     title:     Validators.text(200),
     content:   Validators.text(10000),
@@ -1112,6 +1273,7 @@ app.post('/api/threads',
 app.put('/api/threads/:id',
   writeLimiter,
   authenticateToken,
+  requireActiveAdmission,
   validate({
     title:     Validators.text(200),
     content:   Validators.text(10000),
@@ -1161,7 +1323,7 @@ app.put('/api/threads/:id',
 );
 
 // ── Threads: Delete (requires auth) ──────────────────────────────────────────
-app.delete('/api/threads/:id', authenticateToken, async (req, res) => {
+app.delete('/api/threads/:id', authenticateToken, requireActiveAdmission, async (req, res) => {
   try {
     const { id } = req.params;
     const thread = await DB.get('SELECT * FROM threads WHERE id = ?', [id]);
@@ -1186,6 +1348,7 @@ app.delete('/api/threads/:id', authenticateToken, async (req, res) => {
 app.post('/api/threads/:id/vote',
   writeLimiter,
   authenticateToken,
+  requireActiveAdmission,
   validate({
     value:     Validators.voteValue,
     signature: Validators.signature,
@@ -1247,6 +1410,7 @@ app.get('/api/threads/:id/replies', optionalAuthenticateToken, (req, res) => {
 app.post('/api/threads/:id/replies',
   writeLimiter,
   authenticateToken,
+  requireActiveAdmission,
   validate({
     content:   Validators.text(5000),
     signature: Validators.signature,
@@ -1289,7 +1453,7 @@ app.post('/api/threads/:id/replies',
 );
 
 // ── Replies: Delete (requires auth) ──────────────────────────────────────────
-app.delete('/api/threads/:threadId/replies/:replyId', authenticateToken, (req, res) => {
+app.delete('/api/threads/:threadId/replies/:replyId', authenticateToken, requireActiveAdmission, (req, res) => {
   const { replyId } = req.params;
 
   db.get('SELECT * FROM replies WHERE id = ?', [replyId], (err, reply) => {

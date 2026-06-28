@@ -9,7 +9,7 @@
     JetBrains Mono is loaded directly from index.css via @font-face (self-hosted subset)
     or falls back to system monospace.
   -->
-  <link rel="stylesheet" href="index.css">
+  <link rel="stylesheet" href="index.css?v=1.1.3">
   <!-- KaTeX Math Styling -->
   <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/katex@0.16.9/dist/katex.min.css">
   
@@ -40,6 +40,7 @@
       </div>
       <nav class="header-nav">
         <button id="nav-btn-feed" class="c2-btn active">◇ threads</button>
+        <button id="nav-btn-admission" class="c2-btn hide" style="color: #ff9900; border-color: #ff9900; text-shadow: 0 0 5px rgba(255, 153, 0, 0.5); font-weight: bold;">[ ADMISSION PORTAL ]</button>
         <button id="nav-btn-profile" class="c2-btn hide">◇ profile</button>
         <button id="btn-login" class="c2-btn">◇ login</button>
       </nav>
@@ -187,6 +188,11 @@
                 </div>
                 <button type="submit" class="c2-btn block-btn" style="margin-top: 10px;">Save changes</button>
               </form>
+
+              <div id="profile-admission-box" class="hide" style="margin-top: 15px; border: 1px dashed #ff9900; padding: 10px; text-align: center;">
+                <div style="color: #ff9900; font-size: 11px; margin-bottom: 8px; font-weight: bold;">ADMISSION STATUS: PENDING</div>
+                <button id="btn-profile-admission" type="button" class="c2-btn block-btn" style="color: #ff9900; border-color: #ff9900; font-weight: bold; background: none;">[ ENTER ADMISSION PORTAL ]</button>
+              </div>
             </div>
 
             <div class="profile-security-card">
@@ -263,7 +269,6 @@
       </div>
     </div>
   </div>
-
-  <script src="app.js"></script>
+  <script src="app.js?v=1.1.3"></script>
 </body>
 </html>
