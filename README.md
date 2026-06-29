@@ -80,3 +80,8 @@ Commanders have advanced, quiet moderation capabilities:
 **GNU General Public License v3.0 (GPLv3)** — See [LICENSE](LICENSE).
 
 This project is Free Software: it can be redistributed and/or modified under the terms of the GNU GPLv3 as published by the Free Software Foundation.
+
+---
+
+**Developed by Eduardo "Noir0x63" Camarillo**
+[noir0x63.github.io](https://noir0x63.github.io)
