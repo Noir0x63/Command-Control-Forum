@@ -71,4 +71,12 @@ Commanders have advanced, quiet moderation capabilities:
     ```
 
 4.  **Access:**
-    Open `http://localhost:3000` (or the public tunnel address) in your browser.
+    Open `http://localhost:3000` (or the public tunnel address) in the browser.
+
+---
+
+## License
+
+**GNU General Public License v3.0 (GPLv3)** — See [LICENSE](LICENSE).
+
+This project is Free Software: it can be redistributed and/or modified under the terms of the GNU GPLv3 as published by the Free Software Foundation.
